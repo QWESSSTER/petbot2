@@ -20,7 +20,7 @@ from formatting import (
 )
 from ai import extract_from_image
 from geocoding import geocode_address
-from maps import generate_map_image
+from maps import generate_folium_html
 
 FIELD_ORDER = ["name", "category", "address", "hours", "avg_price", "promotions", "comment"]
 
@@ -195,7 +195,7 @@ def register_handlers(dp: Dispatcher):
             "📋 */list* — места куда хочешь пойти.\n\n"
             "✅ */done* — места где уже побывал (с оценкой и впечатлением).\n\n"
             "🎲 */random* — случайное непосещённое место.\n\n"
-            "🗺 */map* — карта всех мест (если адреса распознаны).\n\n"
+            "🗺 */map* — интерактивная карта (HTML-файл, открывается в браузере).\n\n"
             "🔗 */share* — код для совместного списка с другом.\n\n"
             "👥 */join* — подключиться к списку друга по коду.",
             parse_mode="Markdown",
@@ -246,9 +246,9 @@ def register_handlers(dp: Dispatcher):
             await message.answer("📭 Список пуст.")
             return
 
-        status = await message.answer("🗺 Генерирую карту...")
-        img_bytes = generate_map_image(locations)
-        if not img_bytes:
+        status = await message.answer("🗺 Генерирую интерактивную карту...")
+        html = generate_folium_html(locations)
+        if not html:
             await status.edit_text(
                 "⚠️ Не удалось построить карту — адреса мест не были геокодированы.\n\n"
                 "Убедись, что при добавлении мест указывал адрес (город, улица)."
@@ -258,17 +258,23 @@ def register_handlers(dp: Dispatcher):
         total = len(locations)
         geo_count = sum(1 for r in locations if r[14] is not None)
         unvisited = sum(1 for r in locations if not r[11])
-        visited = total - unvisited
+        visited_count = total - unvisited
 
-        caption = (
-            f"🗺 *Карта мест*\n\n"
-            f"🟢 Хочу посетить: {unvisited}\n"
-            f"🔵 Посетил: {visited}\n"
-            f"📍 Показано на карте: {geo_count} из {total}"
-        )
-        photo = BufferedInputFile(img_bytes, filename="map.png")
+        html_bytes = html.encode("utf-8")
+        doc = BufferedInputFile(html_bytes, filename="my_places_map.html")
         await status.delete()
-        await message.answer_photo(photo, caption=caption, parse_mode="Markdown")
+        await message.answer_document(
+            doc,
+            caption=(
+                f"🗺 *Интерактивная карта мест*\n\n"
+                f"🟢 Хочу посетить: {unvisited}\n"
+                f"🔵 Посетил: {visited_count}\n"
+                f"📍 На карте: {geo_count} из {total}\n\n"
+                f"_Открой файл в браузере — карту можно зумить, "
+                f"приближать, кликать на метки._"
+            ),
+            parse_mode="Markdown",
+        )
 
     @dp.message(Command("share"))
     async def cmd_share(message: Message):
