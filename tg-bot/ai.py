@@ -1,11 +1,11 @@
 import json
 import io
 import PIL.Image
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY
 
-genai.configure(api_key=GEMINI_API_KEY)
-_model = genai.GenerativeModel("gemini-1.5-flash")
+_client = genai.Client(api_key=GEMINI_API_KEY)
 
 _PROMPT = (
     "Извлеки информацию о заведении или локации из этого изображения. "
@@ -30,7 +30,10 @@ async def extract_from_image(image_data: bytes) -> tuple[dict, str | None]:
     """
     try:
         image = PIL.Image.open(io.BytesIO(image_data))
-        response = _model.generate_content([_PROMPT, image])
+        response = _client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[_PROMPT, image],
+        )
         text = response.text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
