@@ -58,16 +58,15 @@ _TEXT_ERROR = (
 
 # Vision models for image analysis
 _VISION_MODELS = [
-    "qwen/qwen2.5-vl-72b-instruct:free",
-    "meta-llama/llama-4-scout:free",
-    "mistralai/pixtral-12b:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "openrouter/free",
 ]
 
-# Text models for place lookup
 _TEXT_MODELS = [
-    "meta-llama/llama-4-scout:free",
-    "qwen/qwen2.5-72b-instruct:free",
-    "mistralai/mistral-7b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "openrouter/free",
 ]
 
 # ─── Internal callers ────────────────────────────────────────────────────────
