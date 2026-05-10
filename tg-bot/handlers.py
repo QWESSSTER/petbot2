@@ -18,7 +18,7 @@ from formatting import (
     skip_impression_keyboard, all_list_keyboard,
     PAGE_SIZE, STARS,
 )
-from ai import extract_from_image
+from ai import extract_from_image, lookup_place_by_name
 from geocoding import geocode_address
 from maps import generate_folium_html
 
@@ -191,7 +191,8 @@ def register_handlers(dp: Dispatcher):
         await message.answer(
             "*Как пользоваться ботом:*\n\n"
             "📸 *Добавить из фото* — пришли скриншот из Instagram/Stories.\n\n"
-            "✏️ *Добавить текстом* — напиши название, я спрошу детали.\n\n"
+            "✏️ *Добавить текстом* — напиши название, я сначала поищу информацию сам, "
+            "затем уточню только то, чего не нашёл.\n\n"
             "📋 */list* — места куда хочешь пойти.\n\n"
             "✅ */done* — места где уже побывал (с оценкой и впечатлением).\n\n"
             "🎲 */random* — случайное непосещённое место.\n\n"
@@ -416,12 +417,34 @@ def register_handlers(dp: Dispatcher):
             await ask_next_missing(message, state)
             return
 
-        # New place from text
+        # ── New place from text: сначала ищем через AI ────────────────────────
         if current is None:
+            place_name = message.text.strip()
+            status_msg = await message.answer("🔍 Ищу информацию о месте...")
+
+            extracted, error = await lookup_place_by_name(place_name)
+
+            if error:
+                await status_msg.edit_text(f"⚠️ {error}")
+
+            # Показываем что нашли
+            found = {k: v for k, v in extracted.items() if v}
+            missing_fields = [k for k in ["address", "hours", "avg_price", "promotions"] if not extracted.get(k)]
+
+            if len(found) > 1:  # нашли что-то кроме имени
+                lines = [f"• *{k}*: {v}" for k, v in found.items()]
+                summary = "Вот что удалось найти:\n" + "\n".join(lines)
+                if missing_fields:
+                    summary += f"\n\n❓ Не нашёл: {', '.join(missing_fields)} — спрошу отдельно."
+                await status_msg.edit_text(summary, parse_mode="Markdown")
+            else:
+                await status_msg.edit_text(
+                    f"📍 Добавляю *{place_name}*\n\nНичего не нашёл автоматически — уточню детали.",
+                    parse_mode="Markdown",
+                )
+
             await state.update_data(
-                location={"name": message.text.strip(), "category": None,
-                           "address": None, "hours": None, "avg_price": None,
-                           "promotions": None, "comment": None},
+                location={**extracted, "category": None, "comment": None},
                 user_id=user_id,
                 username=username,
             )
