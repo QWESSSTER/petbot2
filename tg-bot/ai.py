@@ -60,7 +60,8 @@ _TEXT_ERROR = (
 _VISION_MODELS = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
-    "openrouter/free",
+    "nvidia/llama-3.2-11b-vision-instruct:free",
+    "meta-llama/llama-4-maverick:free",
 ]
 
 _TEXT_MODELS = [

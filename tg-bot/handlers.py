@@ -410,10 +410,28 @@ def register_handlers(dp: Dispatcher):
             AddLocation.asking_promotions.state: "promotions",
             AddLocation.asking_comment.state:    "comment",
         }
-        if current in field_map:
+       if current in field_map:
             data = await state.get_data()
-            data["location"][field_map[current]] = message.text.strip()
+            field = field_map[current]
+            data["location"][field] = message.text.strip()
             await state.update_data(location=data["location"])
+
+            # Если ввели имя — пробуем найти инфо через AI
+            if field == "name":
+                place_name = message.text.strip()
+                status_msg = await message.answer("🔍 Ищу информацию о месте...")
+                extracted, error = await lookup_place_by_name(place_name)
+                found = {k: v for k, v in extracted.items() if v and k != "name"}
+                if found:
+                    lines = [f"• {k}: {v}" for k, v in found.items()]
+                    await status_msg.edit_text("Вот что нашёл:\n" + "\n".join(lines))
+                    merged = {**extracted, **{k: v for k, v in data["location"].items() if v}}
+                    merged["category"] = None
+                    merged["comment"] = None
+                    await state.update_data(location=merged)
+                else:
+                    await status_msg.delete()
+
             await ask_next_missing(message, state)
             return
 
