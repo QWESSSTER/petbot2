@@ -2,7 +2,6 @@ import json
 import io
 import PIL.Image
 from google import genai
-from google.genai import types
 from config import GEMINI_API_KEY
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
@@ -22,6 +21,8 @@ _EMPTY: dict = {
     "promotions": None,
 }
 
+_USER_ERROR = "Произошла ошибка при анализе изображения. Попробуй ещё раз или введи название места вручную. Если ошибка повторяется — обратись в поддержку."
+
 
 async def extract_from_image(image_data: bytes) -> tuple[dict, str | None]:
     """
@@ -31,7 +32,7 @@ async def extract_from_image(image_data: bytes) -> tuple[dict, str | None]:
     try:
         image = PIL.Image.open(io.BytesIO(image_data))
         response = _client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             contents=[_PROMPT, image],
         )
         text = response.text.strip()
@@ -39,6 +40,6 @@ async def extract_from_image(image_data: bytes) -> tuple[dict, str | None]:
         data = json.loads(text)
         return data, None
     except json.JSONDecodeError:
-        return _EMPTY.copy(), "Gemini вернул неожиданный ответ — не смог распознать данные."
-    except Exception as e:
-        return _EMPTY.copy(), f"Ошибка при анализе изображения: {e}"
+        return _EMPTY.copy(), _USER_ERROR
+    except Exception:
+        return _EMPTY.copy(), _USER_ERROR
