@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "dF4bAIdgM1PBWIYlcptUk"
+uri = "file://tg-bot.zip"
+type = "unspecified"
+title = "Telegram Bot — все файлы"
