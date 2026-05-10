@@ -344,7 +344,7 @@ def register_handlers(dp: Dispatcher):
         if missing:
             summary += f"\n\n❓ Не нашёл: {', '.join(missing)} — спрошу отдельно."
 
-        await status_msg.edit_text(summary, parse_mode="Markdown")
+        await status_msg.edit_text(summary, parse_mode=None)
         await state.update_data(
             location={**extracted, "category": None, "comment": None},
             user_id=user_id,
@@ -436,7 +436,7 @@ def register_handlers(dp: Dispatcher):
                 summary = "Вот что удалось найти:\n" + "\n".join(lines)
                 if missing_fields:
                     summary += f"\n\n❓ Не нашёл: {', '.join(missing_fields)} — спрошу отдельно."
-                await status_msg.edit_text(summary, parse_mode="Markdown")
+                await status_msg.edit_text(summary, parse_mode=None)
             else:
                 await status_msg.edit_text(
                     f"📍 Добавляю *{place_name}*\n\nНичего не нашёл автоматически — уточню детали.",
