@@ -22,17 +22,34 @@ async def init_db():
                 added_by INTEGER,
                 added_by_name TEXT,
                 name TEXT,
+                category TEXT,
                 address TEXT,
                 hours TEXT,
                 avg_price TEXT,
                 promotions TEXT,
                 comment TEXT,
-                visited INTEGER DEFAULT 0
+                visited INTEGER DEFAULT 0,
+                rating INTEGER,
+                impression TEXT,
+                latitude REAL,
+                longitude REAL
             );
             CREATE INDEX IF NOT EXISTS idx_list_members_user ON list_members(user_id);
             CREATE INDEX IF NOT EXISTS idx_list_members_list ON list_members(list_id);
             CREATE INDEX IF NOT EXISTS idx_locations_list ON locations(list_id);
         """)
+        # Migrate existing DBs: add new columns if missing
+        for col, typedef in [
+            ("category",   "TEXT"),
+            ("rating",     "INTEGER"),
+            ("impression", "TEXT"),
+            ("latitude",   "REAL"),
+            ("longitude",  "REAL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE locations ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass
         await db.commit()
 
 
@@ -62,12 +79,19 @@ async def get_user_list_id(user_id: int) -> str | None:
     return row[0] if row else None
 
 
-async def get_locations(list_id: str) -> list:
+async def get_locations(list_id: str, visited: int | None = None) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT * FROM locations WHERE list_id = ?", (list_id,)
-        ) as cur:
-            return await cur.fetchall()
+        if visited is None:
+            async with db.execute(
+                "SELECT * FROM locations WHERE list_id = ?", (list_id,)
+            ) as cur:
+                return await cur.fetchall()
+        else:
+            async with db.execute(
+                "SELECT * FROM locations WHERE list_id = ? AND visited = ?",
+                (list_id, visited),
+            ) as cur:
+                return await cur.fetchall()
 
 
 async def add_location_db(
@@ -76,16 +100,20 @@ async def add_location_db(
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO locations
-               (list_id, added_by, added_by_name, name, address, hours, avg_price, promotions, comment)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (list_id, added_by, added_by_name, name, category, address, hours,
+                avg_price, promotions, comment, latitude, longitude)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 list_id, user_id, username,
                 data.get("name", ""),
+                data.get("category", ""),
                 data.get("address", ""),
                 data.get("hours", ""),
                 data.get("avg_price", ""),
                 data.get("promotions", ""),
                 data.get("comment", ""),
+                data.get("latitude"),
+                data.get("longitude"),
             ),
         )
         await db.commit()
@@ -97,20 +125,24 @@ async def delete_location_db(loc_id: int):
         await db.commit()
 
 
-async def toggle_visited_db(loc_id: int) -> bool:
+async def mark_visited_db(loc_id: int, rating: int, impression: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT visited FROM locations WHERE id = ?", (loc_id,)
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            return False
-        new_val = 0 if row[0] else 1
         await db.execute(
-            "UPDATE locations SET visited = ? WHERE id = ?", (new_val, loc_id)
+            "UPDATE locations SET visited = 1, rating = ?, impression = ? WHERE id = ?",
+            (rating, impression, loc_id),
         )
         await db.commit()
-    return bool(new_val)
+    return True
+
+
+async def unmark_visited_db(loc_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE locations SET visited = 0, rating = NULL, impression = NULL WHERE id = ?",
+            (loc_id,),
+        )
+        await db.commit()
+    return False
 
 
 async def is_shared_list(list_id: str) -> bool:
@@ -145,3 +177,21 @@ async def get_list_members(list_id: str) -> list[int]:
         ) as cur:
             rows = await cur.fetchall()
     return [r[0] for r in rows]
+
+
+async def get_random_unvisited(list_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT * FROM locations WHERE list_id = ? AND visited = 0 ORDER BY RANDOM() LIMIT 1",
+            (list_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def update_coordinates(loc_id: int, lat: float, lon: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE locations SET latitude = ?, longitude = ? WHERE id = ?",
+            (lat, lon, loc_id),
+        )
+        await db.commit()

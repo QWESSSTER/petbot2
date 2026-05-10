@@ -1,27 +1,32 @@
 import asyncio
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 
-from states import AddLocation, JoinList
+from states import AddLocation, JoinList, RateVisit
 from database import (
     get_or_create_list, get_user_list_id, get_locations,
-    add_location_db, delete_location_db, toggle_visited_db,
+    add_location_db, delete_location_db,
+    mark_visited_db, unmark_visited_db,
     is_shared_list, join_list_db, get_list_members,
+    get_random_unvisited, update_coordinates,
 )
 from formatting import (
-    format_location, nav_keyboard, confirm_delete_keyboard,
-    skip_keyboard, all_list_keyboard, MAX_LIST_ITEMS,
+    format_location, nav_keyboard, rating_keyboard,
+    confirm_delete_keyboard, skip_keyboard, category_keyboard,
+    skip_impression_keyboard, all_list_keyboard,
+    PAGE_SIZE, STARS,
 )
 from ai import extract_from_image
+from geocoding import geocode_address
+from maps import generate_map_image
 
-PAGE_SIZE = 20
-
-FIELD_ORDER = ["name", "address", "hours", "avg_price", "promotions", "comment"]
+FIELD_ORDER = ["name", "category", "address", "hours", "avg_price", "promotions", "comment"]
 
 FIELD_PROMPTS = {
     "name":       ("📍 Как называется это место?",         False),
+    "category":   ("🏷 Выбери категорию:",                 False),
     "address":    ("🗺 Введи адрес:",                       True),
     "hours":      ("🕐 Часы работы (напр. 10:00–22:00):",  True),
     "avg_price":  ("💰 Средний чек (напр. ~1500 ₽):",      True),
@@ -31,6 +36,7 @@ FIELD_PROMPTS = {
 
 FIELD_STATES = {
     "name":       AddLocation.asking_name,
+    "category":   AddLocation.asking_category,
     "address":    AddLocation.asking_address,
     "hours":      AddLocation.asking_hours,
     "avg_price":  AddLocation.asking_price,
@@ -52,7 +58,50 @@ async def _notify_members(bot: Bot, list_id: str, exclude_id: int, text: str):
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
         if isinstance(r, Exception):
-            pass  # Пользователь заблокировал бота — игнорируем
+            pass
+
+
+async def _show_tab(message_or_cb: Message | CallbackQuery, tab: str, index: int = 0):
+    """Show a location card for the given tab (plan/done)."""
+    if isinstance(message_or_cb, CallbackQuery):
+        user_id = message_or_cb.from_user.id
+        send = message_or_cb.message.edit_text
+    else:
+        user_id = message_or_cb.from_user.id
+        send = message_or_cb.answer
+
+    list_id = await get_user_list_id(user_id)
+    if not list_id:
+        if isinstance(message_or_cb, CallbackQuery):
+            await message_or_cb.answer("Сначала /start")
+        else:
+            await message_or_cb.answer("Сначала запусти бота — /start")
+        return
+
+    visited_filter = 0 if tab == "plan" else 1
+    locations = await get_locations(list_id, visited=visited_filter)
+    shared = await is_shared_list(list_id)
+
+    if not locations:
+        label = "📭 Список \"Куда идём\" пуст!" if tab == "plan" else "📭 Список \"Куда сходили\" пуст!"
+        hint = "\n\nПришли скриншот или напиши название места." if tab == "plan" else ""
+        tabs_text = label + hint
+        if isinstance(message_or_cb, CallbackQuery):
+            await message_or_cb.message.edit_text(tabs_text)
+            await message_or_cb.answer()
+        else:
+            await message_or_cb.answer(tabs_text)
+        return
+
+    index = max(0, min(index, len(locations) - 1))
+    row = locations[index]
+    text = format_location(row, show_author=shared)
+    kb = nav_keyboard(index, len(locations), row[0], bool(row[11]), tab=tab)
+    if isinstance(message_or_cb, CallbackQuery):
+        await message_or_cb.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await message_or_cb.answer()
+    else:
+        await message_or_cb.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def ask_next_missing(target: Message | CallbackQuery, state: FSMContext):
@@ -64,8 +113,11 @@ async def ask_next_missing(target: Message | CallbackQuery, state: FSMContext):
         if loc.get(field) is None:
             prompt, skippable = FIELD_PROMPTS[field]
             await state.set_state(FIELD_STATES[field])
-            kb = skip_keyboard() if skippable else None
-            await msg.answer(prompt, reply_markup=kb)
+            if field == "category":
+                await msg.answer(prompt, reply_markup=category_keyboard())
+            else:
+                kb = skip_keyboard() if skippable else None
+                await msg.answer(prompt, reply_markup=kb)
             return
 
     await finalize_location(target, state)
@@ -78,6 +130,12 @@ async def finalize_location(target: Message | CallbackQuery, state: FSMContext):
     username = data["username"]
     bot: Bot = target.bot
 
+    # Geocode address in background
+    if loc.get("address"):
+        coords = await geocode_address(loc["address"])
+        if coords:
+            loc["latitude"], loc["longitude"] = coords
+
     list_id = await get_user_list_id(user_id) or await get_or_create_list(user_id, username)
     await add_location_db(list_id, user_id, username, loc)
 
@@ -86,7 +144,7 @@ async def finalize_location(target: Message | CallbackQuery, state: FSMContext):
         f"🔔 *{username}* добавил новое место:\n\n📍 *{loc.get('name', '—')}*"
     )
 
-    locations = await get_locations(list_id)
+    locations = await get_locations(list_id, visited=0)
     index = len(locations) - 1
     row = locations[index]
     shared = await is_shared_list(list_id)
@@ -95,13 +153,15 @@ async def finalize_location(target: Message | CallbackQuery, state: FSMContext):
     msg = target.message if isinstance(target, CallbackQuery) else target
     await msg.answer(
         text,
-        reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[10])),
+        reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[11]), tab="plan"),
         parse_mode="Markdown",
     )
     await state.clear()
 
 
 def register_handlers(dp: Dispatcher):
+
+    # ─── Commands ────────────────────────────────────────────────────────────────
 
     @dp.message(CommandStart())
     async def cmd_start(message: Message):
@@ -111,15 +171,18 @@ def register_handlers(dp: Dispatcher):
         await message.answer(
             f"👋 Привет, *{username}*!\n\n"
             f"Я помогаю собирать места, которые хочется посетить.\n\n"
-            f"Просто пришли *скриншот* (сторис, пост) или напиши *название места* — "
-            f"я извлеку всю информацию и сохраню.\n\n"
+            f"Пришли *скриншот* (сторис, пост) или напиши *название места* — "
+            f"я извлеку информацию и сохраню.\n\n"
             f"🔑 Твой код списка: `{list_id}`\n\n"
             f"*Команды:*\n"
-            f"/list — листать список\n"
+            f"/list — список \"Куда идём\"\n"
+            f"/done — список \"Куда сходили\"\n"
+            f"/random — случайное непосещённое место\n"
+            f"/map — карта всех мест\n"
             f"/share — поделиться списком\n"
             f"/join — подключиться к чужому списку\n"
             f"/help — помощь\n"
-            f"/cancel — отменить текущее действие",
+            f"/cancel — отменить действие",
             parse_mode="Markdown",
         )
 
@@ -127,13 +190,14 @@ def register_handlers(dp: Dispatcher):
     async def cmd_help(message: Message):
         await message.answer(
             "*Как пользоваться ботом:*\n\n"
-            "📸 *Добавить место из фото* — пришли скриншот из Instagram/Stories, я сам распознаю название и адрес.\n\n"
-            "✏️ *Добавить текстом* — просто напиши название места и я спрошу детали.\n\n"
-            "📋 */list* — листать сохранённые места (◀️ / ▶️ или введи номер).\n\n"
-            "🔗 */share* — получить код для совместного списка.\n\n"
-            "👥 */join* — подключиться к списку друга по коду.\n\n"
-            "✅ *Отметить посещённым* — кнопка в карточке места.\n\n"
-            "🗑 *Удалить* — кнопка в карточке (с подтверждением).",
+            "📸 *Добавить из фото* — пришли скриншот из Instagram/Stories.\n\n"
+            "✏️ *Добавить текстом* — напиши название, я спрошу детали.\n\n"
+            "📋 */list* — места куда хочешь пойти.\n\n"
+            "✅ */done* — места где уже побывал (с оценкой и впечатлением).\n\n"
+            "🎲 */random* — случайное непосещённое место.\n\n"
+            "🗺 */map* — карта всех мест (если адреса распознаны).\n\n"
+            "🔗 */share* — код для совместного списка с другом.\n\n"
+            "👥 */join* — подключиться к списку друга по коду.",
             parse_mode="Markdown",
         )
 
@@ -144,6 +208,34 @@ def register_handlers(dp: Dispatcher):
 
     @dp.message(Command("list"))
     async def cmd_list(message: Message):
+        await _show_tab(message, tab="plan")
+
+    @dp.message(Command("done"))
+    async def cmd_done(message: Message):
+        await _show_tab(message, tab="done")
+
+    @dp.message(Command("random"))
+    async def cmd_random(message: Message):
+        user_id = message.from_user.id
+        list_id = await get_user_list_id(user_id)
+        if not list_id:
+            await message.answer("Сначала запусти бота — /start")
+            return
+        row = await get_random_unvisited(list_id)
+        if not row:
+            await message.answer("📭 Нет непосещённых мест. Добавь что-нибудь!")
+            return
+        shared = await is_shared_list(list_id)
+        locations = await get_locations(list_id, visited=0)
+        index = next((i for i, r in enumerate(locations) if r[0] == row[0]), 0)
+        await message.answer(
+            f"🎲 *Случайное место:*\n\n" + format_location(row, show_author=shared),
+            reply_markup=nav_keyboard(index, len(locations), row[0], False, tab="plan"),
+            parse_mode="Markdown",
+        )
+
+    @dp.message(Command("map"))
+    async def cmd_map(message: Message):
         user_id = message.from_user.id
         list_id = await get_user_list_id(user_id)
         if not list_id:
@@ -151,15 +243,32 @@ def register_handlers(dp: Dispatcher):
             return
         locations = await get_locations(list_id)
         if not locations:
-            await message.answer("📭 Список пуст. Пришли скриншот или название места!")
+            await message.answer("📭 Список пуст.")
             return
-        shared = await is_shared_list(list_id)
-        row = locations[0]
-        await message.answer(
-            format_location(row, show_author=shared),
-            reply_markup=nav_keyboard(0, len(locations), row[0], bool(row[10])),
-            parse_mode="Markdown",
+
+        status = await message.answer("🗺 Генерирую карту...")
+        img_bytes = generate_map_image(locations)
+        if not img_bytes:
+            await status.edit_text(
+                "⚠️ Не удалось построить карту — адреса мест не были геокодированы.\n\n"
+                "Убедись, что при добавлении мест указывал адрес (город, улица)."
+            )
+            return
+
+        total = len(locations)
+        geo_count = sum(1 for r in locations if r[14] is not None)
+        unvisited = sum(1 for r in locations if not r[11])
+        visited = total - unvisited
+
+        caption = (
+            f"🗺 *Карта мест*\n\n"
+            f"🟢 Хочу посетить: {unvisited}\n"
+            f"🔵 Посетил: {visited}\n"
+            f"📍 Показано на карте: {geo_count} из {total}"
         )
+        photo = BufferedInputFile(img_bytes, filename="map.png")
+        await status.delete()
+        await message.answer_photo(photo, caption=caption, parse_mode="Markdown")
 
     @dp.message(Command("share"))
     async def cmd_share(message: Message):
@@ -167,8 +276,8 @@ def register_handlers(dp: Dispatcher):
         list_id = await get_user_list_id(user_id)
         await message.answer(
             f"🔗 Поделись этим кодом с другом:\n\n`{list_id}`\n\n"
-            f"Друг пишет /join и вводит этот код — после этого вы видите общий список, "
-            f"а рядом с каждым местом появляется имя того, кто его добавил.",
+            f"Друг пишет /join и вводит этот код — "
+            f"вы увидите общий список с именами авторов.",
             parse_mode="Markdown",
         )
 
@@ -176,6 +285,8 @@ def register_handlers(dp: Dispatcher):
     async def cmd_join(message: Message, state: FSMContext):
         await state.set_state(JoinList.entering_code)
         await message.answer("Введи код списка:")
+
+    # ─── Join flow ───────────────────────────────────────────────────────────────
 
     @dp.message(JoinList.entering_code)
     async def process_join_code(message: Message, state: FSMContext):
@@ -195,13 +306,14 @@ def register_handlers(dp: Dispatcher):
             await message.answer("❌ Код не найден. Проверь и попробуй снова.")
         await state.clear()
 
+    # ─── Photo handler ───────────────────────────────────────────────────────────
+
     @dp.message(F.photo)
     async def handle_photo(message: Message, state: FSMContext):
         user_id = message.from_user.id
         username = _get_username(message.from_user)
 
         status_msg = await message.answer("🔍 Анализирую изображение...")
-
         photo = message.photo[-1]
         file = await message.bot.get_file(photo.file_id)
         file_bytes = await message.bot.download_file(file.file_path)
@@ -212,8 +324,8 @@ def register_handlers(dp: Dispatcher):
         if error:
             await status_msg.edit_text(f"⚠️ {error}\n\nВведи название места вручную:")
             await state.update_data(
-                location={"name": None, "address": None, "hours": None,
-                           "avg_price": None, "promotions": None, "comment": None},
+                location={"name": None, "category": None, "address": None,
+                           "hours": None, "avg_price": None, "promotions": None, "comment": None},
                 user_id=user_id, username=username,
             )
             await state.set_state(AddLocation.asking_name)
@@ -227,11 +339,13 @@ def register_handlers(dp: Dispatcher):
 
         await status_msg.edit_text(summary, parse_mode="Markdown")
         await state.update_data(
-            location={**extracted, "comment": None},
+            location={**extracted, "category": None, "comment": None},
             user_id=user_id,
             username=username,
         )
         await ask_next_missing(message, state)
+
+    # ─── Text handler ─────────────────────────────────────────────────────────────
 
     @dp.message(F.text & ~F.text.startswith("/"))
     async def handle_text(message: Message, state: FSMContext):
@@ -239,24 +353,48 @@ def register_handlers(dp: Dispatcher):
         user_id = message.from_user.id
         username = _get_username(message.from_user)
 
+        # Navigate by number
         if current is None and message.text.strip().isdigit():
             list_id = await get_user_list_id(user_id)
             if not list_id:
                 return
-            locations = await get_locations(list_id)
+            locations = await get_locations(list_id, visited=0)
             index = int(message.text.strip()) - 1
             if 0 <= index < len(locations):
                 row = locations[index]
                 shared = await is_shared_list(list_id)
                 await message.answer(
                     format_location(row, show_author=shared),
-                    reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[10])),
+                    reply_markup=nav_keyboard(index, len(locations), row[0], False, tab="plan"),
                     parse_mode="Markdown",
                 )
             else:
-                await message.answer(f"Нет места с таким номером. Всего в списке: {len(locations)}")
+                await message.answer(f"Нет места с таким номером. В списке: {len(locations)}")
             return
 
+        # FSM: impression input
+        if current == RateVisit.asking_impression.state:
+            data = await state.get_data()
+            loc_id = data["rating_loc_id"]
+            index = data["rating_index"]
+            rating = data["rating_value"]
+            impression = message.text.strip()
+            await mark_visited_db(loc_id, rating, impression)
+            await state.clear()
+            list_id = await get_user_list_id(user_id)
+            locations = await get_locations(list_id, visited=1)
+            idx = next((i for i, r in enumerate(locations) if r[0] == loc_id), 0)
+            shared = await is_shared_list(list_id)
+            row = locations[idx]
+            await message.answer(
+                f"🌟 Отлично! Место перемещено в \"Куда сходили\".\n\n" +
+                format_location(row, show_author=shared),
+                reply_markup=nav_keyboard(idx, len(locations), row[0], True, tab="done"),
+                parse_mode="Markdown",
+            )
+            return
+
+        # FSM: AddLocation fields
         field_map = {
             AddLocation.asking_name.state:       "name",
             AddLocation.asking_address.state:    "address",
@@ -272,13 +410,18 @@ def register_handlers(dp: Dispatcher):
             await ask_next_missing(message, state)
             return
 
-        await state.update_data(
-            location={"name": message.text.strip(), "address": None, "hours": None,
-                       "avg_price": None, "promotions": None, "comment": None},
-            user_id=user_id,
-            username=username,
-        )
-        await ask_next_missing(message, state)
+        # New place from text
+        if current is None:
+            await state.update_data(
+                location={"name": message.text.strip(), "category": None,
+                           "address": None, "hours": None, "avg_price": None,
+                           "promotions": None, "comment": None},
+                user_id=user_id,
+                username=username,
+            )
+            await ask_next_missing(message, state)
+
+    # ─── Skip field ──────────────────────────────────────────────────────────────
 
     @dp.callback_query(F.data == "skip_field")
     async def cb_skip_field(callback: CallbackQuery, state: FSMContext):
@@ -297,31 +440,43 @@ def register_handlers(dp: Dispatcher):
             await callback.answer()
             await ask_next_missing(callback, state)
 
+    # ─── Category selection ──────────────────────────────────────────────────────
+
+    @dp.callback_query(F.data.startswith("set_category:"))
+    async def cb_set_category(callback: CallbackQuery, state: FSMContext):
+        category = callback.data[len("set_category:"):]
+        data = await state.get_data()
+        data["location"]["category"] = category
+        await state.update_data(location=data["location"])
+        await callback.answer()
+        await ask_next_missing(callback, state)
+
+    # ─── Tab switching ───────────────────────────────────────────────────────────
+
+    @dp.callback_query(F.data.startswith("tab:"))
+    async def cb_tab(callback: CallbackQuery):
+        _, tab, index = callback.data.split(":")
+        await _show_tab(callback, tab=tab, index=int(index))
+
+    # ─── Navigation ──────────────────────────────────────────────────────────────
+
     @dp.callback_query(F.data.startswith("nav:"))
     async def cb_nav(callback: CallbackQuery):
-        index = int(callback.data.split(":")[1])
-        user_id = callback.from_user.id
-        list_id = await get_user_list_id(user_id)
-        locations = await get_locations(list_id)
-        if not locations:
-            await callback.answer("Список пуст")
-            return
-        index = max(0, min(index, len(locations) - 1))
-        row = locations[index]
-        shared = await is_shared_list(list_id)
-        await callback.message.edit_text(
-            format_location(row, show_author=shared),
-            reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[10])),
-            parse_mode="Markdown",
-        )
-        await callback.answer()
+        parts = callback.data.split(":")
+        index = int(parts[1])
+        tab = parts[2] if len(parts) > 2 else "plan"
+        await _show_tab(callback, tab=tab, index=index)
+
+    # ─── Full list (paginated) ───────────────────────────────────────────────────
 
     @dp.callback_query(F.data.startswith("show_all:"))
     async def cb_show_all(callback: CallbackQuery):
-        page = int(callback.data.split(":")[1])
+        _, tab, page_str = callback.data.split(":")
+        page = int(page_str)
         user_id = callback.from_user.id
         list_id = await get_user_list_id(user_id)
-        locations = await get_locations(list_id)
+        visited_filter = 0 if tab == "plan" else 1
+        locations = await get_locations(list_id, visited=visited_filter)
         shared = await is_shared_list(list_id)
 
         total_pages = max(1, (len(locations) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -329,71 +484,135 @@ def register_handlers(dp: Dispatcher):
         start = page * PAGE_SIZE
         chunk = locations[start: start + PAGE_SIZE]
 
+        label = "🗺 Куда идём" if tab == "plan" else "✅ Куда сходили"
         lines = []
         for i, row in enumerate(chunk):
             real_i = start + i
-            visited_mark = " ✅" if row[10] else ""
+            visited_mark = " ✅" if row[11] else ""
+            stars = f" {STARS.get(row[12], '')}" if row[12] else ""
             author = f" *({row[3]})*" if shared else ""
-            lines.append(f"{real_i+1}. {row[4]}{visited_mark}{author}")
+            lines.append(f"{real_i+1}. {row[4]}{visited_mark}{stars}{author}")
 
-        header = f"📋 *Все места:* (стр. {page+1}/{total_pages})\n\n"
-        text = header + "\n".join(lines) + "\n\n_Напиши номер, чтобы открыть подробнее._"
-
-        kb = all_list_keyboard(page, total_pages)
+        text = (
+            f"📋 *{label}* (стр. {page+1}/{total_pages})\n\n"
+            + "\n".join(lines)
+            + "\n\n_Напиши номер, чтобы открыть подробнее._"
+        )
+        kb = all_list_keyboard(tab, page, total_pages)
         await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
         await callback.answer()
 
-    @dp.callback_query(F.data.startswith("confirm_delete:"))
-    async def cb_confirm_delete(callback: CallbackQuery):
+    # ─── Mark visited (start rating flow) ────────────────────────────────────────
+
+    @dp.callback_query(F.data.startswith("start_rate:"))
+    async def cb_start_rate(callback: CallbackQuery, state: FSMContext):
         _, loc_id, index = callback.data.split(":")
         loc_id, index = int(loc_id), int(index)
+        await state.set_state(RateVisit.asking_rating)
+        await state.update_data(rating_loc_id=loc_id, rating_index=index)
+        await callback.message.answer(
+            "🌟 *Оцени место:*\nВыбери от 1 до 5 звёзд",
+            reply_markup=rating_keyboard(loc_id, index),
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("rate:"))
+    async def cb_rate(callback: CallbackQuery, state: FSMContext):
+        _, loc_id, index, rating = callback.data.split(":")
+        loc_id, index, rating = int(loc_id), int(index), int(rating)
+        await state.update_data(rating_value=rating)
+        await state.set_state(RateVisit.asking_impression)
+        stars = STARS.get(rating, "")
+        await callback.message.edit_text(
+            f"Оценка: {stars}\n\n✍️ Напиши впечатление о месте (или пропусти):",
+            reply_markup=skip_impression_keyboard(loc_id, index),
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("skip_impression:"))
+    async def cb_skip_impression(callback: CallbackQuery, state: FSMContext):
+        _, loc_id, index = callback.data.split(":")
+        loc_id, index = int(loc_id), int(index)
+        data = await state.get_data()
+        rating = data.get("rating_value", 5)
+        await mark_visited_db(loc_id, rating, "")
+        await state.clear()
+        user_id = callback.from_user.id
+        list_id = await get_user_list_id(user_id)
+        locations = await get_locations(list_id, visited=1)
+        idx = next((i for i, r in enumerate(locations) if r[0] == loc_id), 0)
+        shared = await is_shared_list(list_id)
+        row = locations[idx]
+        await callback.message.edit_text(
+            f"🌟 Место перемещено в \"Куда сходили\"!\n\n" +
+            format_location(row, show_author=shared),
+            reply_markup=nav_keyboard(idx, len(locations), row[0], True, tab="done"),
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+
+    # ─── Unmark visited ───────────────────────────────────────────────────────────
+
+    @dp.callback_query(F.data.startswith("unvisit:"))
+    async def cb_unvisit(callback: CallbackQuery):
+        parts = callback.data.split(":")
+        loc_id, index = int(parts[1]), int(parts[2])
+        tab = parts[3] if len(parts) > 3 else "done"
+        await unmark_visited_db(loc_id)
+        user_id = callback.from_user.id
+        list_id = await get_user_list_id(user_id)
+        locations = await get_locations(list_id, visited=0)
+        idx = next((i for i, r in enumerate(locations) if r[0] == loc_id), 0)
+        shared = await is_shared_list(list_id)
+        if not locations:
+            await callback.message.edit_text("📭 Список \"Куда идём\" пуст.")
+            await callback.answer("↩️ Отметка снята")
+            return
+        row = locations[idx]
+        await callback.message.edit_text(
+            format_location(row, show_author=shared),
+            reply_markup=nav_keyboard(idx, len(locations), row[0], False, tab="plan"),
+            parse_mode="Markdown",
+        )
+        await callback.answer("↩️ Место возвращено в список \"Куда идём\"")
+
+    # ─── Delete with confirmation ─────────────────────────────────────────────────
+
+    @dp.callback_query(F.data.startswith("confirm_delete:"))
+    async def cb_confirm_delete(callback: CallbackQuery):
+        parts = callback.data.split(":")
+        loc_id, index = int(parts[1]), int(parts[2])
+        tab = parts[3] if len(parts) > 3 else "plan"
         await callback.message.edit_reply_markup(
-            reply_markup=confirm_delete_keyboard(loc_id, index)
+            reply_markup=confirm_delete_keyboard(loc_id, index, tab)
         )
         await callback.answer("Подтверди удаление")
 
     @dp.callback_query(F.data.startswith("delete:"))
     async def cb_delete(callback: CallbackQuery):
-        _, loc_id, index = callback.data.split(":")
-        loc_id, index = int(loc_id), int(index)
+        parts = callback.data.split(":")
+        loc_id, index = int(parts[1]), int(parts[2])
+        tab = parts[3] if len(parts) > 3 else "plan"
         await delete_location_db(loc_id)
         user_id = callback.from_user.id
         list_id = await get_user_list_id(user_id)
-        locations = await get_locations(list_id)
+        visited_filter = 0 if tab == "plan" else 1
+        locations = await get_locations(list_id, visited=visited_filter)
         if not locations:
             await callback.message.edit_text("📭 Список теперь пуст.")
-            await callback.answer("Удалено")
+            await callback.answer("🗑 Удалено")
             return
         index = min(index, len(locations) - 1)
         row = locations[index]
         shared = await is_shared_list(list_id)
         await callback.message.edit_text(
             format_location(row, show_author=shared),
-            reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[10])),
+            reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[11]), tab=tab),
             parse_mode="Markdown",
         )
         await callback.answer("🗑 Место удалено")
-
-    @dp.callback_query(F.data.startswith("visited:"))
-    async def cb_visited(callback: CallbackQuery):
-        _, loc_id, index = callback.data.split(":")
-        loc_id, index = int(loc_id), int(index)
-        is_visited = await toggle_visited_db(loc_id)
-        user_id = callback.from_user.id
-        list_id = await get_user_list_id(user_id)
-        locations = await get_locations(list_id)
-        if not locations or index >= len(locations):
-            await callback.answer("Место не найдено")
-            return
-        row = locations[index]
-        shared = await is_shared_list(list_id)
-        mark = "✅ Отмечено как посещённое!" if is_visited else "↩️ Отметка снята."
-        await callback.message.edit_text(
-            format_location(row, show_author=shared),
-            reply_markup=nav_keyboard(index, len(locations), row[0], bool(row[10])),
-            parse_mode="Markdown",
-        )
-        await callback.answer(mark)
 
     @dp.callback_query(F.data == "noop")
     async def cb_noop(callback: CallbackQuery):
