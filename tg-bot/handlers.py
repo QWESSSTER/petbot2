@@ -410,7 +410,7 @@ def register_handlers(dp: Dispatcher):
             AddLocation.asking_promotions.state: "promotions",
             AddLocation.asking_comment.state:    "comment",
         }
-       if current in field_map:
+        if current in field_map:
             data = await state.get_data()
             field = field_map[current]
             data["location"][field] = message.text.strip()
